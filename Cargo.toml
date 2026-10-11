@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/matrix-core"]
+resolver = "3"
+
+[package]
+name = "audio-matrix"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Native Windows audio routing, channel mapping and per-output DSP"
+license = "MIT"
+
+[dependencies]
+matrix-core = { path = "crates/matrix-core" }
+eframe = { version = "=0.33.3", default-features = false, features = ["default_fonts", "glow"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "=0.25.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+

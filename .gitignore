@@ -1,0 +1,6 @@
+/target/
+/.tools/
+/.dotnet/
+/matrix-preset.json
+*.log
+
