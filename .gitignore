@@ -3,5 +3,6 @@
 /.tools/
 /.dotnet/
 /matrix-preset.json
+/DOC.md
 *.log
 

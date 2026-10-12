@@ -9,6 +9,8 @@ pub enum Action {
     Quieter,
     ToggleRouting,
     Exit,
+    Suspend,
+    Resume,
 }
 
 pub struct Tray {
@@ -177,6 +179,18 @@ mod native {
                 let Some(state) = state.as_ref() else {
                     return;
                 };
+                if message == WM_POWERBROADCAST {
+                    match wp.0 {
+                        4 => deliver(state, Action::Suspend),
+                        7 | 18 => deliver(state, Action::Resume),
+                        _ => {}
+                    }
+                    return;
+                }
+                if message == WM_ENDSESSION && wp.0 != 0 {
+                    deliver(state, Action::Exit);
+                    return;
+                }
                 if message == WM_TIMER
                     && !state.owner.is_invalid()
                     && (!IsWindowVisible(state.owner).as_bool() || IsIconic(state.owner).as_bool())
@@ -258,7 +272,11 @@ mod native {
                     deliver(state, action);
                 }
             });
-            DefWindowProcW(hwnd, message, wp, lp)
+            if message == WM_POWERBROADCAST {
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, message, wp, lp)
+            }
         }
     }
     pub(super) fn start(ctx: eframe::egui::Context, native_window: usize) -> Result<Tray, String> {
@@ -387,6 +405,21 @@ mod native {
                     .unwrap(),
                 Action::Show
             );
+            for (event, expected) in [
+                (4, Action::Suspend),
+                (18, Action::Resume),
+                (7, Action::Resume),
+            ] {
+                unsafe {
+                    PostMessageW(Some(hwnd), WM_POWERBROADCAST, WPARAM(event), LPARAM(0)).unwrap();
+                }
+                assert_eq!(
+                    tray.events
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap(),
+                    expected
+                );
+            }
             drop(tray);
             assert_eq!(window.load(Ordering::Acquire), 0);
             assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());

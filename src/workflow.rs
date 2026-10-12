@@ -11,6 +11,7 @@ pub struct Preferences {
     pub start_with_windows: bool,
     pub close_to_tray: bool,
     pub spectrum: bool,
+    pub recover_input: bool,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -20,6 +21,7 @@ impl Default for Preferences {
             start_with_windows: false,
             close_to_tray: false,
             spectrum: false,
+            recover_input: true,
         }
     }
 }
@@ -71,7 +73,7 @@ impl Scene {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Session {
     pub version: u32,
@@ -79,6 +81,8 @@ pub struct Session {
     pub preset_path: String,
     pub preset: Preset,
     pub scenes: Vec<Scene>,
+    #[serde(default)]
+    pub source_format: Option<crate::audio::Source>,
 }
 impl Session {
     pub fn validate(&self) -> Result<(), String> {
@@ -89,6 +93,30 @@ impl Session {
             return Err("Invalid session preset version/buffer target".into());
         }
         self.preset.validate_controls()?;
+        if let Some(source) = &self.source_format {
+            use crate::audio::{DeviceKind, Source};
+            let matches = match source {
+                Source::Tone => self.preset.source_mode == SourceMode::Tone,
+                Source::Endpoint(device) => {
+                    device.id == self.preset.source_id
+                        && !device.id.is_empty()
+                        && device.id.len() <= 4096
+                        && match self.preset.source_mode {
+                            SourceMode::Playback => device.kind == DeviceKind::Playback,
+                            SourceMode::Capture => device.kind == DeviceKind::Capture,
+                            SourceMode::Tone => false,
+                        }
+                }
+            };
+            if !matches
+                || !(1..=32).contains(&source.channels())
+                || !(8000..=384000).contains(&source.sample_rate())
+            {
+                return Err(
+                    "Session input metadata does not match its selected input/format".into(),
+                );
+            }
+        }
         let mut names = std::collections::HashSet::new();
         for scene in &self.scenes {
             scene.validate()?;
@@ -176,6 +204,7 @@ mod tests {
             preset_path: "user-calibration.json".into(),
             preset,
             scenes: Vec::new(),
+            source_format: None,
         };
         write(&path, &session).unwrap();
         let original = std::fs::read(&path).unwrap();

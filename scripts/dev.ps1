@@ -33,7 +33,7 @@ try {
         if ($Task -eq 'lint') { $arguments += @('--', '-D', 'warnings') }
         if ($Task -eq 'devices') { $arguments += @('--', '--list-devices') }
         if ($Task -eq 'preview') { $arguments += @('--', '--preview-board') }
-        if ($Task -eq 'test-hardware') { $arguments += @('--', '--ignored', '--nocapture') }
+        if ($Task -eq 'test-hardware') { $arguments += @('--', '--ignored', '--nocapture', '--test-threads=1') }
         if ($Task -eq 'test-native') { $arguments += @('--', '--ignored', '--nocapture') }
         & $cargoPath @arguments
         $commandExitCode = $LASTEXITCODE

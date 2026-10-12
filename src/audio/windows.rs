@@ -24,6 +24,35 @@ use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
 type AudioResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(super) type SyncControl = Arc<RwLock<Alignment>>;
 
+struct Realtime(Option<::windows::Win32::Foundation::HANDLE>);
+impl Realtime {
+    fn new() -> Self {
+        use ::windows::{
+            Win32::System::Threading::{
+                AVRT_PRIORITY_HIGH, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
+            },
+            core::w,
+        };
+        let mut index = 0;
+        // MMCSS is scoped to this worker, not REALTIME_PRIORITY_CLASS and not a
+        // registry change. Unavailable scheduling degrades to ordinary threads.
+        let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut index) }.ok();
+        if let Some(handle) = handle {
+            let _ = unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH) };
+        }
+        Self(handle)
+    }
+}
+impl Drop for Realtime {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0 {
+            let _ = unsafe {
+                ::windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(handle)
+            };
+        }
+    }
+}
+
 fn qpc_hns() -> u64 {
     use ::windows::Win32::System::Performance::{
         QueryPerformanceCounter, QueryPerformanceFrequency,
@@ -219,7 +248,10 @@ pub(super) fn spawn_output(
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .register(generation);
-    let stats = Arc::new(Mutex::new(OutputStats::default()));
+    let stats = Arc::new(Mutex::new(OutputStats {
+        peaks: vec![0.0; device.channels],
+        ..Default::default()
+    }));
     let ready = Arc::new(AtomicBool::new(false));
     let local_stop = Arc::new(AtomicBool::new(false));
     let (updates, rx) = mpsc::channel();
@@ -297,6 +329,7 @@ fn capture(
     events: &mpsc::Sender<EngineEvent>,
     ready: &AtomicBool,
 ) -> AudioResult<()> {
+    let _realtime = Realtime::new();
     if let Source::Tone = source {
         ready.store(true, Ordering::Release);
         let _ = events.send(EngineEvent::SourceReady(
@@ -492,6 +525,7 @@ fn render(
     latency_ms: u32,
 ) -> AudioResult<()> {
     let _apartment = ComApartment::new()?;
+    let realtime = Realtime::new();
     let enumerator = DeviceEnumerator::new()?;
     let device = enumerator.get_device(&info.id)?;
     let mut client = device.get_iaudioclient()?;
@@ -533,7 +567,15 @@ fn render(
         PlaybackTracker::with_processing_delay(rate, max_frames, processor.latency_frames());
     let mut reader = Reader::new(rate, latency_ms);
     let mut metrics = BlockMetrics::default();
-    let mut analyzer = matrix_core::spectrum::Analyzer::new(info.channels, rate);
+    let mut analyzer = super::analysis::Tap::new(
+        info.channels,
+        rate,
+        output.len(),
+        spectrum_enabled.clone(),
+        stats.clone(),
+    )?;
+    let mut timing = super::health::Timing::default();
+    let (mut written, mut clipped, mut overloads, mut limited) = (0_u64, 0_u64, 0_u64, 0_u64);
     render.write_to_device(max_frames, &bytes, None)?;
     client.start_stream()?;
     ready.store(true, Ordering::Release);
@@ -560,6 +602,7 @@ fn render(
                 continue;
             }
             missed_events = 0;
+            let block_started = Instant::now();
             processor
                 .set_global_volume(*global_volume.lock().unwrap_or_else(|e| e.into_inner()))?;
             if let Some(config) = updates.try_iter().last() {
@@ -612,20 +655,34 @@ fn render(
             render.write_to_device(frames, bytes, None)?;
             tracker.record(frames, mapping);
             let analyze = spectrum_enabled.load(Ordering::Acquire);
-            let spectrum_ready = analyze && analyzer.push(output);
+            timing.record(
+                block_started.elapsed().as_secs_f32() * 1000.0,
+                frames as f32 * 1000.0 / rate as f32,
+            );
+            if analyze {
+                analyzer.offer(output);
+            }
+            written += frames as u64;
+            clipped += metrics.clipped_samples;
+            overloads += metrics.overload_samples;
+            limited += metrics.limited_frames;
             if let Ok(mut stats) = stats.try_lock() {
-                if spectrum_ready {
-                    stats.spectrum.clone_from(&analyzer.device);
-                    stats.channel_spectra.clone_from(&analyzer.spectra);
-                } else if !analyze {
+                if !analyze {
                     stats.spectrum.clear();
                     stats.channel_spectra.clear();
                 }
+                stats.processing_ms = timing.mean_ms;
+                stats.processing_peak_ms = timing.peak_ms;
+                stats.budget_ms = timing.budget_ms;
+                stats.budget_p95_percent = timing.p95_percent();
+                stats.deadline_misses = timing.misses;
+                stats.analysis_dropped = analyzer.dropped;
+                stats.realtime_scheduled = realtime.0.is_some();
                 stats.peaks.clone_from(&metrics.peaks);
-                stats.frames_written += frames as u64;
-                stats.clipped += metrics.clipped_samples;
-                stats.overload_samples += metrics.overload_samples;
-                stats.limited_frames += metrics.limited_frames;
+                stats.frames_written = written;
+                stats.clipped = clipped;
+                stats.overload_samples = overloads;
+                stats.limited_frames = limited;
                 stats.gain_reduction_db = metrics.gain_reduction_db;
                 stats.true_peak = metrics.true_peak;
                 stats.pre_limiter_peak = metrics.input_peaks.iter().copied().fold(0.0, f32::max);

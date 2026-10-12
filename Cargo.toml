@@ -19,7 +19,7 @@ serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "=0.25.0"
-windows = { version = "=0.62.2", features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Graphics_Dwm", "Win32_System_Performance", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Security", "Win32_Graphics_Gdi"] }
+windows = { version = "=0.62.2", features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Graphics_Dwm", "Win32_System_Performance", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Security", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_Security_Authorization", "Win32_System_RemoteDesktop"] }
 raw-window-handle = "=0.6.2"
 
 [profile.release]

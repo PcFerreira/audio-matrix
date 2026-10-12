@@ -1,21 +1,24 @@
 use matrix_core::{GlobalVolume, OutputConfig};
+use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
 use std::thread::JoinHandle;
+pub mod analysis;
+pub mod health;
 
 #[cfg(windows)]
 mod windows;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceKind {
     Playback,
     Capture,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub id: String,
     pub name: String,
@@ -59,7 +62,7 @@ impl DeviceInfo {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
     Endpoint(DeviceInfo),
     Tone,
@@ -89,8 +92,15 @@ impl Source {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OutputStats {
+    pub processing_ms: f32,
+    pub processing_peak_ms: f32,
+    pub budget_ms: f32,
+    pub budget_p95_percent: f32,
+    pub deadline_misses: u64,
+    pub analysis_dropped: u64,
+    pub realtime_scheduled: bool,
     pub true_peak: f32,
     pub spectrum: Vec<f32>,
     pub channel_spectra: Vec<Vec<f32>>,

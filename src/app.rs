@@ -1,12 +1,13 @@
+use crate::client::Engine;
 use crate::ui_state::{History, Meter};
 use crate::{
-    audio::{self, DeviceInfo, DeviceKind, Engine, EngineEvent, OutputStats, Source},
+    audio::{self, DeviceInfo, DeviceKind, OutputStats, Source},
     eq_presets::{self, EqPreset},
     preset::{Preset, SavedEqPreset, SavedOutput, SourceMode},
 };
 use crate::{
     tray::{Action, Tray},
-    workflow::{self, Preferences, Scene, Session},
+    workflow::{Preferences, Scene, Session},
 };
 use eframe::egui::{self, Color32, RichText};
 use matrix_core::{EqBand, GlobalVolume, OutputConfig, gain_to_db};
@@ -42,15 +43,21 @@ struct Runtime {
     solo_channels: HashSet<(String, usize)>,
     focused: Option<(String, Option<usize>)>,
     retries: HashMap<String, Instant>,
-    checkpoint: Option<BoardSnapshot>,
-    checkpoint_due: Option<Instant>,
-    checkpoint_path: String,
     settings_dirty: bool,
     disabled_persistence: bool,
     hidden: bool,
     quitting: bool,
     pending_session: Option<Preset>,
     pending_autostart: bool,
+    remote: Option<crate::client::Client>,
+    remote_snapshot: Option<crate::protocol::Snapshot>,
+    remote_revision: u64,
+    show_epoch: u64,
+    remote_error: bool,
+    native_window: u64,
+    last_payload: Vec<u8>,
+    last_gain: Option<f32>,
+    last_mute: Option<bool>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -84,7 +91,6 @@ pub struct MatrixApp {
     history_epoch: u64,
     history: History<BoardSnapshot>,
     pending_edit: Option<BoardSnapshot>,
-    sent: HashMap<String, (u64, OutputConfig)>,
     picker: Option<std::sync::mpsc::Receiver<PickerResult>>,
     runtime: Runtime,
 }
@@ -191,14 +197,11 @@ impl MatrixApp {
         let ready = self.runtime.pending_session.as_ref().is_some_and(|p| {
             p.source_mode == SourceMode::Tone || self.devices.iter().any(|d| d.id == p.source_id)
         });
-        if ready
-            && self.engine.is_none()
-            && let Some(preset) = self.runtime.pending_session.take()
-        {
+        if ready && let Some(preset) = self.runtime.pending_session.take() {
             match self.apply_preset(preset) {
                 Ok(_) => {
                     self.report(Ok("Restored last session".into()));
-                    if self.runtime.preferences.auto_start_audio {
+                    if self.runtime.remote.is_none() && self.runtime.preferences.auto_start_audio {
                         self.runtime.pending_autostart = true;
                     }
                 }
@@ -213,6 +216,7 @@ impl MatrixApp {
             self.start();
         }
     }
+    #[cfg(test)]
     fn effective_config(&self, output: &OutputState) -> OutputConfig {
         solo_config(
             output,
@@ -220,99 +224,150 @@ impl MatrixApp {
             &self.runtime.solo_channels,
         )
     }
-    fn restore_session(&mut self) {
-        let Some(path) = workflow::session_path().filter(|p| p.exists()) else {
-            return;
-        };
-        match workflow::read(&path) {
-            Ok(session) => {
-                self.runtime.preferences = session.preferences;
-                self.runtime.scenes = session.scenes;
-                if self.runtime.preferences.restore_session {
-                    self.preset_path = session.preset_path;
-                    let ready = session.preset.source_mode == SourceMode::Tone
-                        || self
-                            .devices
-                            .iter()
-                            .any(|d| d.id == session.preset.source_id);
-                    if ready {
-                        match self.apply_preset(session.preset) {
-                            Ok(_) => {
-                                self.report(Ok(
-                                    "Restored last session (audio stopped unless opted in)".into(),
-                                ));
-                                if self.runtime.preferences.auto_start_audio {
-                                    self.runtime.pending_autostart = true;
-                                }
-                            }
-                            Err(error) => {
-                                self.runtime.disabled_persistence = true;
-                                self.report(Err(format!("Session restore: {error}; checkpoint auto-save disabled to preserve it")));
-                            }
-                        }
-                    } else {
-                        self.runtime.pending_session = Some(session.preset);
-                        self.report(Ok(
-                            "Saved input is offline; waiting to restore its session".into()
-                        ));
-                    }
-                }
-            }
-            Err(error) => {
-                self.runtime.disabled_persistence = true;
-                self.report(Err(format!(
-                    "Session restore: {error}; checkpoint auto-save disabled to preserve it"
-                )));
-            }
-        }
-        self.runtime.checkpoint = Some(self.snapshot());
-        self.runtime.checkpoint_path = self.preset_path.clone();
-    }
-    fn checkpoint(&mut self, force: bool) {
-        if self.runtime.disabled_persistence {
-            return;
-        }
-        let changed = self
+    fn session_for_engine(&self) -> Session {
+        let preset = self
             .runtime
-            .checkpoint
-            .as_ref()
-            .is_none_or(|s| *s != self.snapshot())
-            || self.runtime.settings_dirty
-            || self.runtime.checkpoint_path != self.preset_path;
-        if changed && self.runtime.checkpoint_due.is_none() {
-            self.runtime.checkpoint_due = Some(Instant::now() + Duration::from_secs(2));
-        }
-        if !force
-            && self
-                .runtime
-                .checkpoint_due
-                .is_none_or(|t| Instant::now() < t)
-        {
-            return;
-        }
-        let Some(path) = workflow::session_path() else {
-            return;
-        };
-        let session = Session {
+            .pending_session
+            .clone()
+            .unwrap_or_else(|| self.preset());
+        let source_format = self.source().ok().filter(|source| match source {
+            Source::Tone => preset.source_mode == SourceMode::Tone,
+            Source::Endpoint(device) => {
+                device.id == preset.source_id
+                    && match preset.source_mode {
+                        SourceMode::Playback => device.kind == DeviceKind::Playback,
+                        SourceMode::Capture => device.kind == DeviceKind::Capture,
+                        SourceMode::Tone => false,
+                    }
+            }
+        });
+        Session {
             version: 1,
             preferences: self.runtime.preferences.clone(),
             preset_path: self.preset_path.clone(),
-            preset: self
-                .runtime
-                .pending_session
-                .clone()
-                .unwrap_or_else(|| self.preset()),
+            preset,
             scenes: self.runtime.scenes.clone(),
+            source_format,
+        }
+    }
+    fn checkpoint(&mut self, _force: bool) {
+        self.publish_configuration();
+    }
+    fn publish_configuration(&mut self) {
+        if self.runtime.remote.is_none() {
+            return;
+        }
+        let session = self.session_for_engine();
+        let mut audition = crate::protocol::Audition {
+            devices: self.runtime.solo_devices.iter().cloned().collect(),
+            channels: self.runtime.solo_channels.iter().cloned().collect(),
         };
-        match workflow::write(&path, &session) {
+        audition.devices.sort();
+        audition.channels.sort();
+        let payload = match serde_json::to_vec(&(session.clone(), audition.clone())) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.report(Err(error.to_string()));
+                return;
+            }
+        };
+        if payload == self.runtime.last_payload {
+            return;
+        }
+        let update = crate::protocol::Update {
+            session,
+            audition,
+            base_gain: self.runtime.last_gain,
+            base_mute: self.runtime.last_mute,
+        };
+        match self
+            .runtime
+            .remote
+            .as_ref()
+            .unwrap()
+            .send(crate::protocol::Request::Configure(Box::new(update)))
+        {
             Ok(()) => {
-                self.runtime.checkpoint = Some(self.snapshot());
+                self.runtime.last_payload = payload;
+                self.runtime.last_gain = Some(self.global_volume.gain_db);
+                self.runtime.last_mute = Some(self.global_volume.mute);
                 self.runtime.settings_dirty = false;
-                self.runtime.checkpoint_path = self.preset_path.clone();
             }
             Err(error) => self.report(Err(error)),
         }
-        self.runtime.checkpoint_due = None;
+    }
+    fn attach_engine(&mut self, ctx: &egui::Context, window: u64) {
+        let args: Vec<_> = std::env::args().collect();
+        let instance = args
+            .windows(2)
+            .find(|p| p[0] == "--instance")
+            .map_or("default", |p| p[1].as_str());
+        let test_mode = args.iter().any(|arg| arg == "--test-engine");
+        self.runtime.disabled_persistence = instance != "default";
+        self.runtime.native_window = window;
+        match crate::client::Client::connect(instance, test_mode, ctx.clone(), window) {
+            Ok((client, reply)) => {
+                if test_mode {
+                    self.devices.clear();
+                    self.outputs.clear();
+                    self.source_id.clear();
+                    self.source_mode = SourceMode::Tone;
+                }
+                let snapshot = reply.snapshot;
+                self.runtime.remote_snapshot = Some(snapshot.clone());
+                self.apply_devices(snapshot.devices.clone());
+                self.runtime.solo_devices = snapshot.audition.devices.iter().cloned().collect();
+                self.runtime.solo_channels = snapshot.audition.channels.iter().cloned().collect();
+                if let Some(session) = &snapshot.session {
+                    self.runtime.preferences = session.preferences.clone();
+                    self.runtime.scenes = session.scenes.clone();
+                    if snapshot.wanted || session.preferences.restore_session {
+                        self.preset_path = session.preset_path.clone();
+                        self.source_mode = session.preset.source_mode;
+                        self.source_id = session.preset.source_id.clone();
+                        if let Err(error) = self.apply_preset(session.preset.clone()) {
+                            self.runtime.pending_session = Some(session.preset.clone());
+                            self.report(Err(error));
+                        }
+                    }
+                    self.runtime.last_gain = Some(session.preset.global_gain_db);
+                    self.runtime.last_mute = Some(session.preset.global_mute);
+                }
+                self.runtime.remote = Some(client);
+                self.runtime.last_payload.clear();
+                self.runtime.remote_error = false;
+                self.engine = snapshot.wanted.then(|| Engine::from_snapshot(&snapshot));
+                self.runtime.remote_revision = snapshot.revision;
+                self.runtime.show_epoch = snapshot.show_epoch;
+                self.report(if let Some(error) = reply.error {
+                    Err(error)
+                } else if snapshot.is_error {
+                    Err(snapshot.message.clone())
+                } else {
+                    Ok(snapshot.message.clone())
+                });
+            }
+            Err(error) => {
+                self.runtime.remote_error = true;
+                self.report(Err(error));
+            }
+        }
+    }
+    fn close_engine(&mut self) {
+        let Some(remote) = &self.runtime.remote else {
+            return;
+        };
+        // Flush in the same FIFO as live edits; never write calibration files.
+        let update = crate::protocol::Update {
+            session: self.session_for_engine(),
+            audition: crate::protocol::Audition {
+                devices: self.runtime.solo_devices.iter().cloned().collect(),
+                channels: self.runtime.solo_channels.iter().cloned().collect(),
+            },
+            base_gain: self.runtime.last_gain,
+            base_mute: self.runtime.last_mute,
+        };
+        remote.finish(update, self.runtime.quitting);
     }
     fn save_scene(&mut self) {
         let result = self.source().and_then(|source| {
@@ -427,6 +482,7 @@ impl MatrixApp {
                         self.start();
                     }
                 }
+                Action::Suspend | Action::Resume => {}
                 Action::Exit => {
                     self.runtime.quitting = true;
                     self.checkpoint(true);
@@ -641,7 +697,6 @@ impl MatrixApp {
             history_epoch: 0,
             history: History::default(),
             pending_edit: None,
-            sent: HashMap::new(),
             picker: None,
             runtime: Runtime::default(),
         };
@@ -661,12 +716,7 @@ impl MatrixApp {
                 app.runtime.tray = Tray::start(cc.egui_ctx.clone(), native_window).ok();
             }
         } else {
-            app.restore_session();
-            app.runtime.watcher = audio::DeviceWatcher::start().ok();
-            match Tray::start(cc.egui_ctx.clone(), native_window) {
-                Ok(tray) => app.runtime.tray = Some(tray),
-                Err(error) => app.report(Err(format!("Tray unavailable: {error}"))),
-            }
+            app.attach_engine(&cc.egui_ctx, native_window as u64);
         }
         app
     }
@@ -693,10 +743,35 @@ impl MatrixApp {
         } else {
             DeviceKind::Capture
         };
+        if self.engine.is_some()
+            && let Some(Source::Endpoint(device)) = self
+                .runtime
+                .remote_snapshot
+                .as_ref()
+                .and_then(|s| s.source.as_ref())
+            && device.id == self.source_id
+            && device.kind == kind
+        {
+            return Ok(Source::Endpoint(device.clone()));
+        }
         self.devices
             .iter()
             .find(|d| d.id == self.source_id && d.kind == kind)
             .cloned()
+            .or_else(|| {
+                self.runtime
+                    .remote_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.source.as_ref())
+                    .and_then(|source| match source {
+                        Source::Endpoint(device)
+                            if device.id == self.source_id && device.kind == kind =>
+                        {
+                            Some(device.clone())
+                        }
+                        _ => None,
+                    })
+            })
             .map(Source::Endpoint)
             .ok_or_else(|| "Select an available input endpoint".into())
     }
@@ -725,14 +800,10 @@ impl MatrixApp {
         }
         if let Ok(source) = self.source() {
             for output in &mut self.outputs {
-                if output
-                    .config
-                    .channels
-                    .iter()
-                    .any(|ch| ch.routes.len() != source.channels())
-                {
-                    output.config =
-                        OutputConfig::identity(source.channels(), output.device.channels);
+                // Explicit input reconfiguration changes route dimensions only;
+                // keep device/channel processing and timing calibration intact.
+                for channel in &mut output.config.channels {
+                    channel.routes.resize(source.channels(), 0.0);
                 }
                 // Keep a flat default EQ usable even for low-rate speech endpoints.
                 for band in output
@@ -751,7 +822,11 @@ impl MatrixApp {
         match audio::enumerate_devices() {
             Ok(devices) => {
                 self.apply_devices(devices);
-                if self.source_id.is_empty() {
+                if self.source_id.is_empty()
+                    || (self.engine.is_none()
+                        && self.runtime.pending_session.is_none()
+                        && self.source().is_ok())
+                {
                     self.choose_source();
                 }
                 self.report(Ok(format!(
@@ -772,98 +847,109 @@ impl MatrixApp {
 
     fn start(&mut self) {
         self.runtime.pending_autostart = false;
-        let result = self.source().and_then(|source| {
-            Engine::start(
-                source,
-                self.outputs
-                    .iter()
-                    .filter(|o| o.enabled && o.available)
-                    .map(|o| (o.device.clone(), self.effective_config(o)))
-                    .collect(),
-                self.latency_ms,
-                self.global_volume,
-            )
-        });
-        match result {
-            Ok(engine) => {
-                let mut engine = engine;
-                engine.set_auto_align(self.auto_align);
-                let clock = self
-                    .main_clock_id
-                    .as_deref()
-                    .filter(|id| engine.outputs.iter().any(|o| o.device_id == *id));
-                if let Err(error) = engine.set_main_clock(clock) {
-                    self.report(Err(error));
-                    return;
-                }
-                self.clear_history();
-                self.engine = Some(engine);
-                self.report(Ok("Opening audio streams…".into()));
+        let Some(remote) = &self.runtime.remote else {
+            self.report(Err(
+                "Background engine unavailable; no local audio fallback is used".into(),
+            ));
+            return;
+        };
+        let update = crate::protocol::Update {
+            session: self.session_for_engine(),
+            audition: crate::protocol::Audition {
+                devices: self.runtime.solo_devices.iter().cloned().collect(),
+                channels: self.runtime.solo_channels.iter().cloned().collect(),
+            },
+            base_gain: self.runtime.last_gain,
+            base_mute: self.runtime.last_mute,
+        };
+        let result = remote.send(crate::protocol::Request::Start(Box::new(update)));
+        if result.is_ok() {
+            if let Some(snapshot) = &self.runtime.remote_snapshot {
+                let mut starting = snapshot.clone();
+                starting.wanted = true;
+                starting.live = false;
+                self.engine = Some(Engine::from_snapshot(&starting));
             }
-            Err(error) => self.report(Err(error)),
+            self.clear_history();
+            self.report(Ok("Starting background routing…".into()));
+        } else {
+            self.report(result.map(|_| String::new()));
         }
     }
-
     fn stop(&mut self) {
         self.runtime.pending_autostart = false;
         self.clear_history();
-        self.sent.clear();
-        self.engine.take(); // Drop joins the workers and closes their streams.
+        if let Some(remote) = &self.runtime.remote {
+            let result = remote.send(crate::protocol::Request::Stop);
+            if let Err(error) = result {
+                self.report(Err(error));
+            }
+        }
+        self.engine.take();
     }
-
-    fn poll_engine(&mut self) {
-        let events: Vec<_> = if let Some(engine) = &mut self.engine {
-            engine.reap_finished_workers();
-            engine.events.try_iter().collect()
-        } else {
-            Vec::new()
-        };
-        for event in events {
-            match event {
-                EngineEvent::SourceReady(message) => self.report(Ok(message)),
-                EngineEvent::SourceError(message) => {
-                    self.stop();
-                    self.report(Err(message));
-                    break;
+    fn poll_engine(&mut self, ctx: &egui::Context) {
+        let replies: Vec<_> = self
+            .runtime
+            .remote
+            .as_ref()
+            .map(|client| client.drain())
+            .unwrap_or_default();
+        for result in replies {
+            match result {
+                Err(error) => {
+                    self.runtime.remote_error = self
+                        .runtime
+                        .remote
+                        .as_ref()
+                        .is_none_or(|c| !c.is_connected());
+                    self.report(Err(if self.runtime.remote_error {
+                        format!("Engine control connection lost: {error}. Audio may still be running; use its tray or reconnect.")
+                    } else { error }));
                 }
-                EngineEvent::OutputReady {
-                    device_id,
-                    generation,
-                    message,
-                } => {
-                    if self.engine.as_ref().is_some_and(|e| {
-                        e.outputs
-                            .iter()
-                            .any(|o| o.device_id == device_id && o.generation == generation)
-                    }) {
-                        self.report(Ok(message));
-                    }
-                }
-                EngineEvent::OutputError {
-                    device_id,
-                    generation,
-                    message,
-                } => {
-                    if self
-                        .engine
-                        .as_mut()
-                        .is_some_and(|e| e.remove_output(&device_id, Some(generation)))
+                Ok(reply) => {
+                    let snapshot = reply.snapshot;
+                    self.runtime.remote_error = false;
+                    self.apply_devices(snapshot.devices.clone());
+                    let idle = self
+                        .runtime
+                        .remote
+                        .as_ref()
+                        .is_some_and(|client| client.idle());
+                    if idle
+                        && !ctx.input(|i| i.pointer.any_down())
+                        && let Some(session) = &snapshot.session
                     {
-                        if let Some(output) =
-                            self.outputs.iter_mut().find(|o| o.device.id == device_id)
-                        {
-                            self.runtime.retries.insert(
-                                output.device.id.clone(),
-                                Instant::now() + Duration::from_secs(3),
-                            );
-                        }
-                        self.report(Err(message));
+                        self.global_volume = session.preset.global_volume();
+                        self.runtime.last_gain = Some(self.global_volume.gain_db);
+                        self.runtime.last_mute = Some(self.global_volume.mute);
                     }
+                    if idle {
+                        self.engine = snapshot.wanted.then(|| Engine::from_snapshot(&snapshot));
+                    }
+                    if snapshot.show_epoch != self.runtime.show_epoch {
+                        self.runtime.show_epoch = snapshot.show_epoch;
+                        self.runtime.hidden = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Title("Audio Matrix".into()));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    if snapshot.revision != self.runtime.remote_revision {
+                        self.runtime.remote_revision = snapshot.revision;
+                        self.report(if snapshot.is_error {
+                            Err(snapshot.message.clone())
+                        } else {
+                            Ok(snapshot.message.clone())
+                        });
+                    }
+                    if let Some(error) = reply.error {
+                        self.report(Err(error));
+                    }
+                    self.runtime.remote_snapshot = Some(snapshot);
                 }
             }
         }
     }
-
     fn sync_engine_outputs(&mut self) {
         if self
             .main_clock_id
@@ -872,55 +958,7 @@ impl MatrixApp {
         {
             self.main_clock_id = None;
         }
-        let Some(engine) = &mut self.engine else {
-            return;
-        };
-        let mut errors = Vec::new();
-        for output in &mut self.outputs {
-            let active = engine
-                .outputs
-                .iter()
-                .any(|o| o.device_id == output.device.id);
-            if output.enabled
-                && output.available
-                && !active
-                && self
-                    .runtime
-                    .retries
-                    .get(&output.device.id)
-                    .is_none_or(|t| Instant::now() >= *t)
-            {
-                let config = solo_config(
-                    output,
-                    &self.runtime.solo_devices,
-                    &self.runtime.solo_channels,
-                );
-                if let Err(error) = engine.add_output(output.device.clone(), config) {
-                    self.runtime.retries.insert(
-                        output.device.id.clone(),
-                        Instant::now() + Duration::from_secs(3),
-                    );
-                    errors.push(error);
-                }
-            } else if (!output.enabled || !output.available) && active {
-                engine.remove_output(&output.device.id, None);
-            }
-        }
-        if let Err(error) = engine.set_global_volume(self.global_volume) {
-            errors.push(error);
-        }
-        engine.set_auto_align(self.auto_align);
-        engine.set_spectrum(self.runtime.preferences.spectrum);
-        let clock = self
-            .main_clock_id
-            .as_deref()
-            .filter(|id| engine.outputs.iter().any(|o| o.device_id == *id));
-        if let Err(error) = engine.set_main_clock(clock) {
-            errors.push(error);
-        }
-        if let Some(error) = errors.pop() {
-            self.report(Err(error));
-        }
+        self.publish_configuration();
     }
 
     fn save(&mut self) {
@@ -1008,6 +1046,20 @@ impl MatrixApp {
                     .iter()
                     .find(|d| d.id == preset.source_id && d.kind == kind)
                     .cloned()
+                    .or_else(|| {
+                        self.runtime
+                            .remote_snapshot
+                            .as_ref()
+                            .and_then(|s| s.source.as_ref())
+                            .and_then(|s| match s {
+                                Source::Endpoint(d)
+                                    if d.id == preset.source_id && d.kind == kind =>
+                                {
+                                    Some(d.clone())
+                                }
+                                _ => None,
+                            })
+                    })
                     .ok_or("Preset input is unavailable; reconnect it and refresh devices")?,
             )
         };
@@ -1133,6 +1185,7 @@ fn toggle_set<T: std::hash::Hash + Eq>(set: &mut HashSet<T>, value: T) {
         set.insert(value);
     }
 }
+#[cfg(test)]
 fn solo_config(
     output: &OutputState,
     devices: &HashSet<String>,
@@ -1232,8 +1285,7 @@ impl eframe::App for MatrixApp {
         self.render(ctx);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.checkpoint(true);
-        self.stop();
+        self.close_engine();
     }
 }
 
@@ -1242,7 +1294,7 @@ impl MatrixApp {
         self.poll_picker();
         self.poll_devices();
         self.tray_actions(ctx);
-        self.poll_engine();
+        self.poll_engine(ctx);
         let frame_before = self.snapshot();
         let frame_epoch = self.history_epoch;
         let mut restored = self.shortcuts(ctx);
@@ -1252,7 +1304,12 @@ impl MatrixApp {
         if ctx.input(|i| i.viewport().close_requested())
             && !self.runtime.quitting
             && self.runtime.preferences.close_to_tray
-            && self.runtime.tray.is_some()
+            && (self.runtime.tray.is_some()
+                || self
+                    .runtime
+                    .remote_snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.tray_available))
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1302,7 +1359,11 @@ impl MatrixApp {
                         self.start();
                     }
                     ui.label(
-                        RichText::new(if live {
+                        RichText::new(if self.runtime.remote_error { "CONTROL LOST" }
+                        else if self.runtime.remote_snapshot.as_ref().is_some_and(|s|s.state==crate::protocol::State::Recovering) { "RECOVERING" }
+                        else if self.runtime.remote_snapshot.as_ref().is_some_and(|s|s.state==crate::protocol::State::Suspended) { "SUSPENDED" }
+                        else if self.runtime.remote_snapshot.as_ref().is_some_and(|s|s.state==crate::protocol::State::FormatBlocked) { "FORMAT CHANGED" }
+                        else if live {
                             "● LIVE"
                         } else if running {
                             "● STARTING"
@@ -1354,14 +1415,15 @@ impl MatrixApp {
                         ui.checkbox(&mut self.runtime.preferences.auto_start_audio, "Start audio after restoring (opt-in)");
                     });
                     ui.checkbox(&mut self.runtime.preferences.close_to_tray, "Close window to tray");
-                    if ui.checkbox(&mut self.runtime.preferences.start_with_windows, "Run at Windows sign-in").changed()
+                    ui.checkbox(&mut self.runtime.preferences.recover_input, "Recover selected input / Windows resume");
+                    if ui.add_enabled(!self.runtime.disabled_persistence, egui::Checkbox::new(&mut self.runtime.preferences.start_with_windows, "Run at Windows sign-in")).changed()
                         && let Err(error) = crate::tray::set_startup(self.runtime.preferences.start_with_windows) {
                         self.runtime.preferences.start_with_windows = before.start_with_windows;
                         self.report(Err(error));
                     }
                     ui.checkbox(&mut self.runtime.preferences.spectrum, "Live output spectrum");
                     if before != self.runtime.preferences { self.runtime.settings_dirty = true; }
-                    if ui.add_enabled(self.runtime.tray.is_some(), egui::Button::new("Hide to tray")).clicked() {
+                    if ui.add_enabled(self.runtime.tray.is_some() || self.runtime.remote_snapshot.as_ref().is_some_and(|s|s.tray_available), egui::Button::new("Hide to tray")).clicked() {
                         self.runtime.hidden = true; ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)); ui.close();
                     }
                     if ui.button("Exit and stop audio").clicked() {
@@ -1369,6 +1431,11 @@ impl MatrixApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     ui.separator();
+                    if self.runtime.remote_error && ui.button("Reconnect engine control").clicked() {
+                        self.runtime.remote.take(); self.attach_engine(ctx,self.runtime.native_window);
+                    }
+                    if let Some(snapshot)=&self.runtime.remote_snapshot { ui.label(format!("Engine PID {} · recoveries {}",snapshot.engine_pid,snapshot.recoveries)); }
+                    ui.label("Closing this console keeps background audio running.");
                     ui.label("Ctrl+S Save / Ctrl+Shift+S Save as");
                     ui.label("Ctrl+Z Undo / Ctrl+Y Redo / Ctrl+M Mute all");
                     ui.label("Select a device/channel: M mute / S solo");
@@ -1386,6 +1453,29 @@ impl MatrixApp {
         // Start/Stop can change the engine during this frame.
         let running = self.engine.is_some();
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
+            // Fixed diagnostics row: rising counters never add/remove widgets.
+            let mut budget = 0.0_f32;
+            let mut misses = 0_u64;
+            let mut underruns = 0_u64;
+            let mut analysis_dropped = 0_u64;
+            let mut scheduled = 0;
+            let mut total = 0;
+            if let Some(engine) = &self.engine {
+                for output in &engine.outputs {
+                    if let Ok(stats) = output.stats.try_lock() {
+                        budget = budget.max(stats.budget_p95_percent);
+                        misses += stats.deadline_misses;
+                        underruns += stats.underruns;
+                        analysis_dropped += stats.analysis_dropped;
+                        scheduled += usize::from(stats.realtime_scheduled);
+                        total += 1;
+                    }
+                }
+            }
+            ui.add_sized([ui.available_width(),20.0], egui::Label::new(RichText::new(format!(
+                "ENGINE HEALTH  ·  block load p95 ≈ {budget:.0}%  ·  over-budget {misses}  ·  underruns {underruns}  ·  skipped FFT {analysis_dropped}  ·  MMCSS {scheduled}/{total}"
+            )).small().color(if misses > 0 || underruns > 0 { AMBER } else { DIM })).truncate())
+                .on_hover_text("Approximate processing-time budget, not whole-process CPU usage. Counters are cumulative per renderer; skipped visualization frames never discard audio.");
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(&self.status).color(if self.is_error {
                     Color32::from_rgb(255, 126, 126)
@@ -1491,7 +1581,7 @@ impl MatrixApp {
                 ui.checkbox(&mut self.auto_align, "Auto-align outputs").on_hover_text(
                     "Use Windows presentation clocks to delay faster outputs to match the slowest. Does not measure internal speaker/monitor processing.");
                 if ui.add_enabled(running && self.auto_align, egui::Button::new("Re-align")).clicked()
-                    && let Some(engine) = &mut self.engine { engine.realign(); }
+                    && let Some(remote) = &self.runtime.remote { remote.realign(); }
                 ui.label(RichText::new("Manual trim covers latency Windows cannot see.").small().color(DIM));
                 ui.add_space(10.0);
                 ui.label(RichText::new("OUTPUT DEVICES").strong().color(DIM));
@@ -1611,27 +1701,6 @@ impl MatrixApp {
                 .iter()
                 .any(|o| o.enabled && o.device.id == *id && *index < o.config.channels.len())
         });
-        if let Some(engine) = &self.engine {
-            for output in &self.outputs {
-                let config = self.effective_config(output);
-                if let Some(handle) = engine
-                    .outputs
-                    .iter()
-                    .find(|h| h.device_id == output.device.id)
-                    && self
-                        .sent
-                        .get(&output.device.id)
-                        .is_none_or(|(generation, config)| {
-                            *generation != handle.generation
-                                || *config != self.effective_config(output)
-                        })
-                    && handle.updates.send(config.clone()).is_ok()
-                {
-                    self.sent
-                        .insert(output.device.id.clone(), (handle.generation, config));
-                }
-            }
-        }
         if frame_epoch != self.history_epoch {
             self.pending_edit = None;
         }
@@ -2613,6 +2682,33 @@ fn eq_curve_spectrum(
 }
 
 fn draw_stats(ui: &mut egui::Ui, stats: &OutputStats, device: &DeviceInfo) {
+    ui.label(
+        RichText::new(format!(
+            "Audio work {:.3} ms avg / {:.3} ms peak · block budget {:.2} ms",
+            stats.processing_ms, stats.processing_peak_ms, stats.budget_ms
+        ))
+        .small()
+        .color(DIM),
+    );
+    ui.label(
+        RichText::new(format!(
+            "Approx. p95 {:.0}% budget · deadlines {} · FFT drops {} · {}",
+            stats.budget_p95_percent,
+            stats.deadline_misses,
+            stats.analysis_dropped,
+            if stats.realtime_scheduled {
+                "MMCSS Pro Audio"
+            } else {
+                "ordinary scheduling"
+            }
+        ))
+        .small()
+        .color(if stats.budget_p95_percent > 80.0 {
+            AMBER
+        } else {
+            DIM
+        }),
+    );
     ui.label(RichText::new("OUTPUT METERS").strong().color(DIM));
     for (index, peak) in stats.peaks.iter().enumerate() {
         ui.horizontal(|ui| {
@@ -2769,6 +2865,36 @@ mod tests {
         app.poll_devices();
         assert!(!app.runtime.pending_autostart);
         assert!(app.engine.is_none());
+    }
+    #[test]
+    fn explicit_input_layout_reconfiguration_preserves_dsp_and_calibration() {
+        let mut app = board();
+        let mut config = app.outputs[0].config.clone();
+        config.delay_ms = 127.0;
+        config.gain_db = -18.0;
+        config.limiter.true_peak = true;
+        config.eq[2].gain_db = 3.0;
+        config.channels[0].routes = vec![0.3, 0.7];
+        app.outputs[0].config = config.clone();
+        app.source_mode = SourceMode::Capture;
+        app.source_id = "changed-input".into();
+        app.devices.push(DeviceInfo {
+            id: app.source_id.clone(),
+            name: "Changed input".into(),
+            kind: DeviceKind::Capture,
+            channels: 4,
+            sample_rate: 48000,
+            channel_mask: 0,
+        });
+        app.choose_source();
+        for channel in &mut config.channels {
+            channel.routes.resize(4, 0.0);
+        }
+        assert_eq!(app.outputs[0].config, config);
+        assert_eq!(
+            app.outputs[0].config.channels[0].routes,
+            vec![0.3, 0.7, 0.0, 0.0]
+        );
     }
     #[test]
     fn letter_shortcuts_do_not_toggle_audio_while_typing() {
@@ -2949,7 +3075,6 @@ mod tests {
             history_epoch: 0,
             history: History::default(),
             pending_edit: None,
-            sent: HashMap::new(),
             picker: None,
             runtime: Runtime {
                 disabled_persistence: true,
