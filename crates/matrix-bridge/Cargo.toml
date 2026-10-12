@@ -1,0 +1,7 @@
+[package]
+name = "matrix-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Allocation-free versioned PCM transport contract for the Matrix Input driver"

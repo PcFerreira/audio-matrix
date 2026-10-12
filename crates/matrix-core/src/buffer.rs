@@ -59,6 +59,14 @@ impl AudioBuffer {
         self.correction * 1_000_000.0
     }
 
+    /// Drop old-clock data and re-prime; retain lifetime diagnostics.
+    pub fn reset_clock(&mut self) {
+        self.samples.clear();
+        self.position = 0.0;
+        self.started = false;
+        self.correction = 0.0;
+    }
+
     fn discard(&mut self, frames: usize) {
         self.samples
             .drain(..frames.min(self.frames()) * self.channels);
@@ -112,6 +120,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clock_reset_does_not_replay_audio_or_clear_diagnostics() {
+        let mut buffer = AudioBuffer::new(2, 48000, 30);
+        buffer.push(&vec![0.5; 60000]);
+        let drops = buffer.dropped_frames;
+        let mut out = [0.0; 960];
+        buffer.pull(&mut out);
+        buffer.reset_clock();
+        assert_eq!(buffer.frames(), 0);
+        assert_eq!(buffer.correction_ppm(), 0.0);
+        assert_eq!(buffer.dropped_frames, drops);
+        buffer.pull(&mut out);
+        assert_eq!(out, [0.0; 960]);
+    }
+
+    #[test]
     fn startup_is_silent_and_frames_preserve_channel_order() {
         let mut b = AudioBuffer::new(2, 48000, 20);
         let mut out = vec![1.0; 480];
@@ -120,7 +143,9 @@ mod tests {
         b.push(&(0..1200).flat_map(|_| [0.2, -0.3]).collect::<Vec<_>>());
         b.pull(&mut out);
         assert!(
-            out.chunks_exact(2)
+            out.as_chunks::<2>()
+                .0
+                .iter()
                 .all(|f| (f[0] - 0.2).abs() < 0.001 && (f[1] + 0.3).abs() < 0.001)
         );
     }
@@ -175,5 +200,42 @@ mod tests {
             );
             assert!((b.correction_ppm() - ppm).abs() < 50.0);
         }
+    }
+
+    #[test]
+    fn follower_tracks_main_clock_with_two_resampling_stages() {
+        let mut main = AudioBuffer::new(2, 48000, 30);
+        let mut follower = AudioBuffer::new(2, 48000, 30);
+        main.push(&vec![0.25; 2880]);
+        follower.push(&vec![0.25; 2880]);
+        let mut input_fraction = 0.0_f64;
+        let mut follower_fraction = 0.0_f64;
+        let mut source = vec![0.25; 962];
+        let mut main_out = [0.0; 960];
+        let mut follower_out = vec![0.0; 962];
+        // Main runs 300 ppm faster than capture; follower is 700 ppm faster than main.
+        for _ in 0..6000 {
+            input_fraction += 480.0 * (1.0 - 300.0 / 1_000_000.0);
+            let input_frames = input_fraction.floor() as usize;
+            input_fraction -= input_frames as f64;
+            source.resize(input_frames * 2, 0.25);
+            main.push(&source);
+            main.pull(&mut main_out);
+            follower.push(&main_out);
+            follower_fraction += 480.0 * (1.0 + 700.0 / 1_000_000.0);
+            let follower_frames = follower_fraction.floor() as usize;
+            follower_fraction -= follower_frames as f64;
+            follower_out.resize(follower_frames * 2, 0.0);
+            follower.pull(&mut follower_out);
+        }
+        assert_eq!(main.underruns + follower.underruns, 0);
+        assert_eq!(main.dropped_frames + follower.dropped_frames, 0);
+        assert!((main.correction_ppm() + 300.0).abs() < 80.0);
+        assert!((follower.correction_ppm() + 700.0).abs() < 80.0);
+        assert!(
+            follower_out
+                .iter()
+                .all(|sample| (*sample - 0.25).abs() < 0.001)
+        );
     }
 }

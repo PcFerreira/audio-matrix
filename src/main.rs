@@ -2,7 +2,12 @@
 
 mod app;
 mod audio;
+mod dialogs;
+mod eq_presets;
 mod preset;
+mod tray;
+mod ui_state;
+mod workflow;
 
 fn main() -> eframe::Result {
     if std::env::args().any(|arg| arg == "--list-devices") {

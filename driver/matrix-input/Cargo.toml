@@ -1,0 +1,36 @@
+[package]
+name = "matrix-input"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Build-only WDM feasibility probe; not yet an audio endpoint"
+
+# Keep kernel dependencies, panic policy and linker flags out of the desktop build.
+[workspace]
+
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+matrix-bridge = { path = "../../crates/matrix-bridge" }
+wdk-sys = "=0.5.1"
+wdk-panic = "=0.4.1"
+
+[build-dependencies]
+wdk-build = "=0.5.1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

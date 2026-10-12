@@ -1,12 +1,30 @@
 //! Platform-independent routing and DSP. No OS handles or external dependencies.
+pub mod alignment;
 pub mod buffer;
 pub mod dsp;
+pub mod eq;
+pub mod limiter;
+pub mod resample;
+pub mod spectrum;
+pub mod timeline;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilterType {
+    #[default]
+    Bell,
+    LowShelf,
+    HighShelf,
+    HighPass,
+    LowPass,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EqBand {
     pub frequency: f32,
     pub gain_db: f32,
     pub q: f32,
+    pub kind: FilterType,
+    pub enabled: bool,
 }
 
 pub fn flat_eq() -> Vec<EqBand> {
@@ -16,6 +34,8 @@ pub fn flat_eq() -> Vec<EqBand> {
             frequency,
             gain_db: 0.0,
             q: 0.707,
+            kind: FilterType::Bell,
+            enabled: true,
         })
         .collect()
 }
@@ -32,6 +52,9 @@ pub struct ChannelConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutputConfig {
+    /// Additional user calibration delay, independent of automatic compensation.
+    pub delay_ms: f32,
+    pub limiter: limiter::LimiterConfig,
     pub gain_db: f32,
     pub mute: bool,
     pub eq: Vec<EqBand>,
@@ -41,6 +64,8 @@ pub struct OutputConfig {
 impl OutputConfig {
     pub fn identity(inputs: usize, outputs: usize) -> Self {
         Self {
+            delay_ms: 0.0,
+            limiter: limiter::LimiterConfig::default(),
             gain_db: -12.0,
             mute: false,
             eq: flat_eq(),
@@ -66,6 +91,10 @@ impl OutputConfig {
     }
 
     pub fn validate(&self, inputs: usize, outputs: usize, sample_rate: u32) -> Result<(), String> {
+        self.limiter.validate()?;
+        if !self.delay_ms.is_finite() || !(0.0..=500.0).contains(&self.delay_ms) {
+            return Err("Manual delay must be between 0 and 500 ms".into());
+        }
         if !(1..=32).contains(&inputs) || !(1..=32).contains(&outputs) || sample_rate < 8000 {
             return Err("Unsupported channel count or sample rate".into());
         }
@@ -122,4 +151,27 @@ pub fn db_to_gain(db: f32) -> f32 {
 }
 pub fn gain_to_db(gain: f32) -> f32 {
     20.0 * gain.max(0.000001).log10()
+}
+
+/// Router-wide attenuation. Unity is the backward-compatible default.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GlobalVolume {
+    pub gain_db: f32,
+    pub mute: bool,
+}
+
+impl GlobalVolume {
+    pub fn validate(self) -> Result<(), String> {
+        if !self.gain_db.is_finite() || !(-60.0..=0.0).contains(&self.gain_db) {
+            return Err("Global volume must be between -60 and 0 dB".into());
+        }
+        Ok(())
+    }
+    pub fn gain(self) -> f32 {
+        if self.mute {
+            0.0
+        } else {
+            db_to_gain(self.gain_db)
+        }
+    }
 }

@@ -1,4 +1,5 @@
 /target/
+/driver/matrix-input/target/
 /.tools/
 /.dotnet/
 /matrix-preset.json
